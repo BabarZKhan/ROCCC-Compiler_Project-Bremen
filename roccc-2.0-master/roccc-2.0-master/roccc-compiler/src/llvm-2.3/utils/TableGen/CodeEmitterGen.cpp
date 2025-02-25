@@ -18,226 +18,148 @@
 #include "Record.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/Debug.h"
+
 using namespace llvm;
 
-void CodeEmitterGen::reverseBits(std::vector<Record*> &Insts) {
-  for (std::vector<Record*>::iterator I = Insts.begin(), E = Insts.end();
-       I != E; ++I) {
-    Record *R = *I;
-    if (R->getName() == "PHI" ||
-        R->getName() == "INLINEASM" ||
-        R->getName() == "LABEL" ||
-        R->getName() == "DECLARE" ||
-        R->getName() == "EXTRACT_SUBREG" ||
-        R->getName() == "INSERT_SUBREG" ||
-        R->getName() == "IMPLICIT_DEF" ||
-        R->getName() == "SUBREG_TO_REG") continue;
-    
-    BitsInit *BI = R->getValueAsBitsInit("Inst");
-
-    unsigned numBits = BI->getNumBits();
-    BitsInit *NewBI = new BitsInit(numBits);
-    for (unsigned bit = 0, end = numBits / 2; bit != end; ++bit) {
-      unsigned bitSwapIdx = numBits - bit - 1;
-      Init *OrigBit = BI->getBit(bit);
-      Init *BitSwap = BI->getBit(bitSwapIdx);
-      NewBI->setBit(bit, BitSwap);
-      NewBI->setBit(bitSwapIdx, OrigBit);
-    }
-    if (numBits % 2) {
-      unsigned middle = (numBits + 1) / 2;
-      NewBI->setBit(middle, BI->getBit(middle));
-    }
-    
-    // Update the bits in reversed order so that emitInstrOpBits will get the
-    // correct endianness.
-    R->getValue("Inst")->setValue(NewBI);
-  }
+namespace {
+const std::unordered_set<std::string> IgnoredInstructions = {
+    "PHI", "INLINEASM", "LABEL", "DECLARE", "EXTRACT_SUBREG",
+    "INSERT_SUBREG", "IMPLICIT_DEF", "SUBREG_TO_REG"};
 }
 
-
-// If the VarBitInit at position 'bit' matches the specified variable then
-// return the variable bit position.  Otherwise return -1.
-int CodeEmitterGen::getVariableBit(const std::string &VarName,
-            BitsInit *BI, int bit) {
-  if (VarBitInit *VBI = dynamic_cast<VarBitInit*>(BI->getBit(bit))) {
-    TypedInit *TI = VBI->getVariable();
-    
-    if (VarInit *VI = dynamic_cast<VarInit*>(TI)) {
-      if (VI->getName() == VarName) return VBI->getBitNum();
+void CodeEmitterGen::reverseBits(std::vector<Record*> &Insts) {
+    for (auto *R : Insts) {
+        if (IgnoredInstructions.count(R->getName())) continue;
+        
+        BitsInit *BI = R->getValueAsBitsInit("Inst");
+        unsigned numBits = BI->getNumBits();
+        auto *NewBI = new BitsInit(numBits);
+        
+        for (unsigned bit = 0; bit < numBits / 2; ++bit) {
+            unsigned bitSwapIdx = numBits - bit - 1;
+            NewBI->setBit(bit, BI->getBit(bitSwapIdx));
+            NewBI->setBit(bitSwapIdx, BI->getBit(bit));
+        }
+        
+        if (numBits % 2) {
+            unsigned middle = numBits / 2;
+            NewBI->setBit(middle, BI->getBit(middle));
+        }
+        
+        R->getValue("Inst")->setValue(NewBI);
     }
-  }
-  
-  return -1;
-} 
+}
 
+int CodeEmitterGen::getVariableBit(const std::string &VarName, BitsInit *BI, int bit) {
+    if (auto *VBI = dyn_cast<VarBitInit>(BI->getBit(bit))) {
+        if (auto *VI = dyn_cast<VarInit>(VBI->getVariable()); VI && VI->getName() == VarName) {
+            return VBI->getBitNum();
+        }
+    }
+    return -1;
+}
 
 void CodeEmitterGen::run(std::ostream &o) {
-  CodeGenTarget Target;
-  std::vector<Record*> Insts = Records.getAllDerivedDefinitions("Instruction");
-  
-  // For little-endian instruction bit encodings, reverse the bit order
-  if (Target.isLittleEndianEncoding()) reverseBits(Insts);
-
-  EmitSourceFileHeader("Machine Code Emitter", o);
-  std::string Namespace = Insts[0]->getValueAsString("Namespace") + "::";
-  
-  std::vector<const CodeGenInstruction*> NumberedInstructions;
-  Target.getInstructionsByEnumValue(NumberedInstructions);
-
-  // Emit function declaration
-  o << "unsigned " << Target.getName() << "CodeEmitter::"
-    << "getBinaryCodeForInstr(MachineInstr &MI) {\n";
-
-  // Emit instruction base values
-  o << "  static const unsigned InstBits[] = {\n";
-  for (std::vector<const CodeGenInstruction*>::iterator
-          IN = NumberedInstructions.begin(),
-          EN = NumberedInstructions.end();
-       IN != EN; ++IN) {
-    const CodeGenInstruction *CGI = *IN;
-    Record *R = CGI->TheDef;
+    CodeGenTarget Target;
+    std::vector<Record*> Insts = Records.getAllDerivedDefinitions("Instruction");
     
-    if (IN != NumberedInstructions.begin()) o << ",\n";
+    if (Target.isLittleEndianEncoding()) reverseBits(Insts);
     
-    if (R->getName() == "PHI" ||
-        R->getName() == "INLINEASM" ||
-        R->getName() == "LABEL" ||
-        R->getName() == "DECLARE" ||
-        R->getName() == "EXTRACT_SUBREG" ||
-        R->getName() == "INSERT_SUBREG" ||
-        R->getName() == "IMPLICIT_DEF" ||
-        R->getName() == "SUBREG_TO_REG") {
-      o << "    0U";
-      continue;
-    }
+    EmitSourceFileHeader("Machine Code Emitter", o);
+    std::string Namespace = Insts.front()->getValueAsString("Namespace") + "::";
     
-    BitsInit *BI = R->getValueAsBitsInit("Inst");
-
-    // Start by filling in fixed values...
-    unsigned Value = 0;
-    for (unsigned i = 0, e = BI->getNumBits(); i != e; ++i) {
-      if (BitInit *B = dynamic_cast<BitInit*>(BI->getBit(e-i-1))) {
-        Value |= B->getValue() << (e-i-1);
-      }
-    }
-    o << "    " << Value << "U";
-  }
-  o << "\n  };\n";
-  
-  // Map to accumulate all the cases.
-  std::map<std::string, std::vector<std::string> > CaseMap;
-  
-  // Construct all cases statement for each opcode
-  for (std::vector<Record*>::iterator IC = Insts.begin(), EC = Insts.end();
-        IC != EC; ++IC) {
-    Record *R = *IC;
-    const std::string &InstName = R->getName();
-    std::string Case("");
+    std::vector<const CodeGenInstruction*> NumberedInstructions;
+    Target.getInstructionsByEnumValue(NumberedInstructions);
     
-    if (InstName == "PHI" ||
-        InstName == "INLINEASM" ||
-        InstName == "LABEL"||
-        InstName == "DECLARE"||
-        InstName == "EXTRACT_SUBREG" ||
-        InstName == "INSERT_SUBREG" ||
-        InstName == "IMPLICIT_DEF" ||
-        InstName == "SUBREG_TO_REG") continue;
+    o << "unsigned " << Target.getName() << "CodeEmitter::getBinaryCodeForInstr(MachineInstr &MI) {\n";
+    o << "  static const unsigned InstBits[] = {\n";
     
-    BitsInit *BI = R->getValueAsBitsInit("Inst");
-    const std::vector<RecordVal> &Vals = R->getValues();
-    CodeGenInstruction &CGI = Target.getInstruction(InstName);
-    
-    // Loop over all of the fields in the instruction, determining which are the
-    // operands to the instruction.
-    unsigned op = 0;
-    for (unsigned i = 0, e = Vals.size(); i != e; ++i) {
-      if (!Vals[i].getPrefix() && !Vals[i].getValue()->isComplete()) {
-        // Is the operand continuous? If so, we can just mask and OR it in
-        // instead of doing it bit-by-bit, saving a lot in runtime cost.
-        const std::string &VarName = Vals[i].getName();
-        bool gotOp = false;
-        
-        for (int bit = BI->getNumBits()-1; bit >= 0; ) {
-          int varBit = getVariableBit(VarName, BI, bit);
-          
-          if (varBit == -1) {
-            --bit;
-          } else {
-            int beginInstBit = bit;
-            int beginVarBit = varBit;
-            int N = 1;
-            
-            for (--bit; bit >= 0;) {
-              varBit = getVariableBit(VarName, BI, bit);
-              if (varBit == -1 || varBit != (beginVarBit - N)) break;
-              ++N;
-              --bit;
-            }
-
-            if (!gotOp) {
-              /// If this operand is not supposed to be emitted by the generated
-              /// emitter, skip it.
-              while (CGI.isFlatOperandNotEmitted(op))
-                ++op;
-              
-              Case += "      // op: " + VarName + "\n"
-                   +  "      op = getMachineOpValue(MI, MI.getOperand("
-                   +  utostr(op++) + "));\n";
-              gotOp = true;
-            }
-            
-            unsigned opMask = (1 << N) - 1;
-            int opShift = beginVarBit - N + 1;
-            opMask <<= opShift;
-            opShift = beginInstBit - beginVarBit;
-            
-            if (opShift > 0) {
-              Case += "      Value |= (op & " + utostr(opMask) + "U) << "
-                   +  itostr(opShift) + ";\n";
-            } else if (opShift < 0) {
-              Case += "      Value |= (op & " + utostr(opMask) + "U) >> "
-                   +  itostr(-opShift) + ";\n";
-            } else {
-              Case += "      Value |= op & " + utostr(opMask) + "U;\n";
-            }
-          }
+    for (const auto *CGI : NumberedInstructions) {
+        Record *R = CGI->TheDef;
+        if (IgnoredInstructions.count(R->getName())) {
+            o << "    0U,\n";
+            continue;
         }
-      }
+        
+        BitsInit *BI = R->getValueAsBitsInit("Inst");
+        unsigned Value = 0;
+        unsigned e = BI->getNumBits();
+        
+        for (unsigned i = 0; i < e; ++i) {
+            if (auto *B = dyn_cast<BitInit>(BI->getBit(e - i - 1))) {
+                Value |= B->getValue() << (e - i - 1);
+            }
+        }
+        
+        o << "    " << Value << "U,\n";
     }
-
-    std::vector<std::string> &InstList = CaseMap[Case];
-    InstList.push_back(InstName);
-  }
-
-
-  // Emit initial function code
-  o << "  const unsigned opcode = MI.getOpcode();\n"
-    << "  unsigned Value = InstBits[opcode];\n"
-    << "  unsigned op;\n"
-    << "  switch (opcode) {\n";
-
-  // Emit each case statement
-  std::map<std::string, std::vector<std::string> >::iterator IE, EE;
-  for (IE = CaseMap.begin(), EE = CaseMap.end(); IE != EE; ++IE) {
-    const std::string &Case = IE->first;
-    std::vector<std::string> &InstList = IE->second;
-
-    for (int i = 0, N = InstList.size(); i < N; i++) {
-      if (i) o << "\n";
-      o << "    case " << Namespace << InstList[i]  << ":";
+    o << "  };\n";
+    
+    o << "  const unsigned opcode = MI.getOpcode();\n"
+      << "  unsigned Value = InstBits[opcode];\n"
+      << "  unsigned op;\n"
+      << "  switch (opcode) {\n";
+    
+    std::map<std::string, std::vector<std::string>> CaseMap;
+    
+    for (auto *R : Insts) {
+        const std::string &InstName = R->getName();
+        if (IgnoredInstructions.count(InstName)) continue;
+        
+        BitsInit *BI = R->getValueAsBitsInit("Inst");
+        CodeGenInstruction &CGI = Target.getInstruction(InstName);
+        
+        std::string Case;
+        unsigned op = 0;
+        
+        for (const auto &Val : R->getValues()) {
+            const std::string &VarName = Val.getName();
+            bool gotOp = false;
+            
+            for (int bit = BI->getNumBits() - 1; bit >= 0;) {
+                int varBit = getVariableBit(VarName, BI, bit);
+                if (varBit == -1) { --bit; continue; }
+                
+                int beginInstBit = bit;
+                int beginVarBit = varBit;
+                int N = 1;
+                
+                for (--bit; bit >= 0; --bit) {
+                    varBit = getVariableBit(VarName, BI, bit);
+                    if (varBit == -1 || varBit != (beginVarBit - N)) break;
+                    ++N;
+                }
+                
+                if (!gotOp) {
+                    while (CGI.isFlatOperandNotEmitted(op)) ++op;
+                    Case += "      op = getMachineOpValue(MI, MI.getOperand(" + utostr(op++) + "));");
+                    gotOp = true;
+                }
+                
+                unsigned opMask = (1U << N) - 1;
+                int opShift = beginVarBit - N + 1;
+                opMask <<= opShift;
+                opShift = beginInstBit - beginVarBit;
+                
+                if (opShift > 0) {
+                    Case += "      Value |= (op & " + utostr(opMask) + "U) << " + itostr(opShift) + ";\n";
+                } else if (opShift < 0) {
+                    Case += "      Value |= (op & " + utostr(opMask) + "U) >> " + itostr(-opShift) + ";\n";
+                } else {
+                    Case += "      Value |= op & " + utostr(opMask) + "U;\n";
+                }
+            }
+        }
+        CaseMap[Case].push_back(InstName);
     }
-    o << " {\n";
-    o << Case;
-    o << "      break;\n"
-      << "    }\n";
-  }
-
-  // Default case: unhandled opcode
-  o << "  default:\n"
-    << "    cerr << \"Not supported instr: \" << MI << \"\\n\";\n"
-    << "    abort();\n"
-    << "  }\n"
-    << "  return Value;\n"
-    << "}\n\n";
+    
+    for (const auto &[Case, InstList] : CaseMap) {
+        for (const auto &Inst : InstList) {
+            o << "    case " << Namespace << Inst << ":\n";
+        }
+        o << "    {\n" << Case << "      break;\n    }\n";
+    }
+    
+    o << "  default:\n    llvm::errs() << \"Not supported instr: \" << MI << "\n";
+    o << "    abort();\n  }\n  return Value;\n}";
 }
